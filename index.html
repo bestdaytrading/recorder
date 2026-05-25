@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Enregistreur + Bookmarks (Mobile OK)</title>
+  <title>Enregistreur + Bookmarks</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
@@ -12,7 +12,7 @@
   </style>
 </head>
 <body>
-  <h1>🎙️ Enregistreur avec Bookmarks 2</h1>
+  <h1>🎙️ Enregistreur avec Bookmarks</h1>
   
   <button id="recordBtn">▶️ Démarrer l'enregistrement</button>
   <button id="stopBtn" disabled>⏹️ Arrêter</button>
@@ -52,7 +52,7 @@
     recordBtn.onclick = async () => {
       try {
         stream = await navigator.mediaDevices.getUserMedia({ 
-          audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 44100 } 
+          audio: { echoCancellation: true, noiseSuppression: true } 
         });
         
         mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
@@ -65,10 +65,10 @@
           fullAudioBlob = new Blob(chunks, { type: 'audio/webm' });
           player.src = URL.createObjectURL(fullAudioBlob);
           splitBtn.disabled = false;
-          log("Enregistrement terminé. Vous pouvez maintenant ajouter des bookmarks ou découper.");
+          log("Enregistrement terminé.");
         };
 
-        mediaRecorder.start(500); // timeslice pour mobile
+        mediaRecorder.start(500);
         startTime = Date.now();
         timerInterval = setInterval(updateTimer, 200);
         isRecording = true;
@@ -78,23 +78,19 @@
         bookmarkBtn.disabled = false;
         log("Enregistrement en cours...");
       } catch (err) {
-        log("Erreur micro : " + err.message);
-        alert("Impossible d'accéder au micro. Vérifiez les permissions.");
+        log("Erreur : " + err.message);
       }
     };
 
     function updateTimer() {
-      if (!startTime) return;
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       timerEl.textContent = `${String(Math.floor(elapsed/60)).padStart(2,'0')}:${String(elapsed%60).padStart(2,'0')}`;
     }
 
-    // Ajouter bookmark SANS popup
     bookmarkBtn.onclick = () => {
       if (!isRecording) return;
       const timeSec = Math.floor((Date.now() - startTime) / 1000);
-      const label = `Bookmark ${bookmarks.length + 1}`;
-      bookmarks.push({ time: timeSec, label });
+      bookmarks.push({ time: timeSec, label: `Bookmark ${bookmarks.length + 1}` });
       renderBookmarks();
       log(`Bookmark ajouté à ${Math.floor(timeSec/60)}:${(timeSec%60).toString().padStart(2,'0')}`);
     };
@@ -109,7 +105,7 @@
         li.style.background = "#f0f0f0";
         li.style.margin = "6px 0";
         li.style.borderRadius = "6px";
-        li.innerHTML = `${b.label} — ${min}:${sec} <button onclick="removeBookmark(${i})" style="float:right; color:red;">×</button>`;
+        li.innerHTML = `${b.label} — ${min}:${sec} <button onclick="removeBookmark(${i})" style="float:right;color:red;">×</button>`;
         bookmarkList.appendChild(li);
       });
     }
@@ -120,10 +116,8 @@
     };
 
     stopBtn.onclick = () => {
-      if (mediaRecorder && isRecording) {
-        mediaRecorder.stop();
-        stream.getTracks().forEach(t => t.stop());
-      }
+      if (mediaRecorder) mediaRecorder.stop();
+      if (stream) stream.getTracks().forEach(t => t.stop());
       clearInterval(timerInterval);
       isRecording = false;
       recordBtn.disabled = false;
@@ -131,14 +125,14 @@
       bookmarkBtn.disabled = true;
     };
 
-    // ====================== DÉCOUPAGE ZIP ======================
+    // ====================== EXPORT ZIP ======================
     splitBtn.onclick = async () => {
       if (!fullAudioBlob || bookmarks.length === 0) {
-        alert("Ajoutez au moins un bookmark avant de découper !");
+        alert("Ajoutez au moins un bookmark !");
         return;
       }
 
-      log("Découpage en cours... (cela peut prendre quelques secondes)");
+      log("Découpage en cours...");
 
       try {
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -148,27 +142,20 @@
         const zip = new JSZip();
         let previousTime = 0;
 
+        // Segments avec bookmarks
         for (let i = 0; i < bookmarks.length; i++) {
           const current = bookmarks[i].time;
           const startSample = Math.floor(previousTime * audioBuffer.sampleRate);
           const endSample = Math.floor(current * audioBuffer.sampleRate);
 
-          const segment = audioCtx.createBuffer(
-            audioBuffer.numberOfChannels,
-            endSample - startSample,
-            audioBuffer.sampleRate
-          );
-
+          const segment = audioCtx.createBuffer(audioBuffer.numberOfChannels, endSample - startSample, audioBuffer.sampleRate);
+          
           for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
-            segment.copyToChannel(
-              audioBuffer.getChannelData(ch).subarray(startSample, endSample),
-              ch
-            );
+            segment.copyToChannel(audioBuffer.getChannelData(ch).subarray(startSample, endSample), ch);
           }
 
           const wavBlob = audioBufferToWav(segment);
-          const filename = `segment_${(i+1).toString().padStart(2,'0')}_${bookmarks[i].label.replace(/[^a-z0-9]/gi, '_')}.wav`;
-          zip.file(filename, wavBlob);
+          zip.file(`${i}.mp3`, wavBlob);   // ← Nommage demandé : 0.mp3, 1.mp3, ...
 
           previousTime = current;
         }
@@ -176,38 +163,33 @@
         // Dernier segment
         if (previousTime < audioBuffer.duration) {
           const startSample = Math.floor(previousTime * audioBuffer.sampleRate);
-          const segment = audioCtx.createBuffer(
-            audioBuffer.numberOfChannels,
-            audioBuffer.length - startSample,
-            audioBuffer.sampleRate
-          );
+          const segment = audioCtx.createBuffer(audioBuffer.numberOfChannels, audioBuffer.length - startSample, audioBuffer.sampleRate);
+          
           for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
             segment.copyToChannel(audioBuffer.getChannelData(ch).subarray(startSample), ch);
           }
+          
           const wavBlob = audioBufferToWav(segment);
-          zip.file(`segment_final.wav`, wavBlob);
+          zip.file(`final.mp3`, wavBlob);
         }
 
         const zipBlob = await zip.generateAsync({ type: "blob" });
         const url = URL.createObjectURL(zipBlob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `enregistrement_${new Date().toISOString().slice(0,10)}.zip`;
-        document.body.appendChild(a);
+        a.download = `enregistrement_segments.zip`;
         a.click();
-        document.body.removeChild(a);
         URL.revokeObjectURL(url);
 
         log("✅ ZIP téléchargé avec succès !");
       } catch (err) {
         console.error(err);
-        log("Erreur lors du découpage : " + err.message);
-        alert("Erreur ZIP : " + err.message + "\nVérifiez la console (F12).");
+        log("Erreur : " + err.message);
       }
     };
 
-    // Fonction WAV
     function audioBufferToWav(buffer) {
+      // ... (même fonction que précédemment - inchangée)
       const numChannels = buffer.numberOfChannels;
       const sampleRate = buffer.sampleRate;
       const format = 1;
