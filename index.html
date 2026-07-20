@@ -2,13 +2,16 @@
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="media-src 'self' blob: data:;">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Enregistreur + Bluetooth Mic</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
     button, select { padding: 12px 16px; margin: 8px 4px; font-size: 16px; width: 100%; max-width: 420px; }
     .status { margin: 15px 0; padding: 12px; background: #e0f0ff; border-radius: 8px; }
+    button:disabled { opacity: 0.5; }
   </style>
 </head>
 <body>
@@ -52,15 +55,14 @@
     const timerEl = document.getElementById('timer');
     const statusEl = document.getElementById('status');
 
-    function log(msg) { 
-      console.log(msg); 
-      statusEl.textContent = msg; 
+    function log(msg) {
+      console.log(msg);
+      statusEl.textContent = msg;
     }
 
     // Charger la liste des microphones
     async function loadMicrophones() {
       try {
-        // Demander permission d'abord
         const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         tempStream.getTracks().forEach(t => t.stop());
 
@@ -96,11 +98,12 @@
         };
 
         stream = await navigator.mediaDevices.getUserMedia(constraints);
-        
+
         mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
         chunks = [];
         bookmarks = [];
         bookmarkList.innerHTML = '';
+        splitBtn.disabled = true;
 
         mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
         mediaRecorder.onstop = () => {
@@ -168,8 +171,88 @@
       bookmarkBtn.disabled = true;
     };
 
-    // Le reste (découpage ZIP avec 0.mp3, 1.mp3..., final.mp3) reste identique à la version précédente
-    // (je peux te le renvoyer complet si tu veux)
+    // Lecture manuelle depuis le player natif : on tente un play() protégé
+    // pour éviter les erreurs silencieuses si l'utilisateur clique play.
+    player.addEventListener('play', () => {
+      player.play().catch(err => log("Lecture impossible : " + err.message));
+    }, { once: false });
+
+    // ---------- Découpage + encodage MP3 + ZIP ----------
+
+    function floatTo16BitPCM(input) {
+      const output = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        let s = Math.max(-1, Math.min(1, input[i]));
+        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      return output;
+    }
+
+    function encodeMp3FromChannel(channelData, sampleRate, startSample, endSample) {
+      const mp3encoder = new lamejs.Mp3Encoder(1, sampleRate, 128);
+      const samples = channelData.subarray(startSample, endSample);
+      const pcm = floatTo16BitPCM(samples);
+      const blockSize = 1152;
+      const mp3Data = [];
+      for (let i = 0; i < pcm.length; i += blockSize) {
+        const chunk = pcm.subarray(i, i + blockSize);
+        const mp3buf = mp3encoder.encodeBuffer(chunk);
+        if (mp3buf.length > 0) mp3Data.push(mp3buf);
+      }
+      const end = mp3encoder.flush();
+      if (end.length > 0) mp3Data.push(end);
+      return new Blob(mp3Data, { type: 'audio/mp3' });
+    }
+
+    splitBtn.onclick = async () => {
+      if (!fullAudioBlob) {
+        log("Aucun enregistrement à découper.");
+        return;
+      }
+      splitBtn.disabled = true;
+      try {
+        log("Décodage de l'audio...");
+        const arrayBuffer = await fullAudioBlob.arrayBuffer();
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const audioCtx = new AudioCtx();
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        const sampleRate = audioBuffer.sampleRate;
+        const channelData = audioBuffer.getChannelData(0); // mono mixdown from channel 0
+
+        const sortedTimes = bookmarks.map(b => b.time).sort((a, b) => a - b);
+        const boundaries = [0, ...sortedTimes, audioBuffer.duration];
+
+        const zip = new JSZip();
+        const segmentCount = boundaries.length - 1;
+
+        for (let i = 0; i < segmentCount; i++) {
+          const startSample = Math.floor(boundaries[i] * sampleRate);
+          const endSample = Math.floor(boundaries[i + 1] * sampleRate);
+          log(`Encodage segment ${i + 1}/${segmentCount}...`);
+          const mp3Blob = encodeMp3FromChannel(channelData, sampleRate, startSample, endSample);
+          const filename = (i === segmentCount - 1) ? 'final.mp3' : `${i}.mp3`;
+          zip.file(filename, mp3Blob);
+        }
+
+        log("Création du ZIP...");
+        const zipBlob = await zip.generateAsync({ type: 'blob' });
+        const url = URL.createObjectURL(zipBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'segments.zip';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        log(`ZIP téléchargé ! (${segmentCount} fichier(s))`);
+        audioCtx.close();
+      } catch (err) {
+        console.error(err);
+        log("Erreur lors du découpage : " + err.message);
+      } finally {
+        splitBtn.disabled = false;
+      }
+    };
 
     // Chargement initial
     window.onload = () => {
