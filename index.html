@@ -106,6 +106,7 @@
         bookmarkList.innerHTML = '';
         splitBtn.disabled = true;
         isFinalizing = false;
+        isSwitchingSegment = false;
 
         // Full-take recorder: only used for the <audio> preview player.
         fullChunks = [];
@@ -141,6 +142,8 @@
       timerEl.textContent = `${String(Math.floor(elapsed/60)).padStart(2,'0')}:${String(elapsed%60).padStart(2,'0')}`;
     }
 
+    let isSwitchingSegment = false;
+
     function startNewSegment() {
       segmentChunks = [];
       segmentRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
@@ -148,23 +151,34 @@
       segmentRecorder.onstop = () => {
         const blob = new Blob(segmentChunks, { type: 'audio/webm' });
         segmentBlobs.push(blob);
+        console.log(`Segment ${segmentBlobs.length - 1} : ${blob.size} octets`);
         if (isFinalizing) {
           splitBtn.disabled = segmentBlobs.length === 0;
           log(`Enregistrement terminé — ${segmentBlobs.length} segment(s) prêt(s) à découper.`);
+        } else {
+          // Only start the next segment once this recorder has fully closed —
+          // starting it earlier (right after calling .stop()) left two
+          // MediaRecorder instances briefly attached to the same track at
+          // once, which is what was corrupting the resulting files.
+          startNewSegment();
+          isSwitchingSegment = false;
+          bookmarkBtn.disabled = false;
         }
       };
       segmentRecorder.start(500);
     }
 
     bookmarkBtn.onclick = () => {
-      if (!isRecording || !segmentRecorder) return;
+      if (!isRecording || !segmentRecorder || isSwitchingSegment) return;
       const timeSec = Math.floor((Date.now() - startTime) / 1000);
       bookmarks.push({ time: timeSec });
       renderBookmarks();
-      log(`Bookmark ajouté à ${Math.floor(timeSec/60)}:${(timeSec%60).toString().padStart(2,'0')} — nouveau segment démarré.`);
-      // Close the current segment natively and start the next one right away.
+      log(`Bookmark ajouté à ${Math.floor(timeSec/60)}:${(timeSec%60).toString().padStart(2,'0')} — clôture du segment...`);
+      isSwitchingSegment = true;
+      bookmarkBtn.disabled = true;
+      // This triggers segmentRecorder.onstop above, which starts the next
+      // segment once the current one is fully closed.
       segmentRecorder.stop();
-      startNewSegment();
     };
 
     function renderBookmarks() {
