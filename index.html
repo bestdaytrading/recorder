@@ -37,11 +37,14 @@
 
   <script>
     // Variables globales
-    let mediaRecorder, stream, fullAudioBlob;
-    let bookmarks = [];
+    let stream, fullAudioBlob;
+    let fullRecorder, fullChunks = [];
+    let segmentRecorder, segmentChunks = [];
+    let segmentBlobs = []; // each entry = one native, precisely-cut webm segment
+    let bookmarks = []; // for display only (timestamps shown in the list)
     let startTime, timerInterval;
-    let chunks = [];
     let isRecording = false;
+    let isFinalizing = false;
     let currentDeviceId = null;
 
     const micSelect = document.getElementById('micSelect');
@@ -99,21 +102,27 @@
 
         stream = await navigator.mediaDevices.getUserMedia(constraints);
 
-        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-        chunks = [];
         bookmarks = [];
+        segmentBlobs = [];
         bookmarkList.innerHTML = '';
         splitBtn.disabled = true;
+        isFinalizing = false;
 
-        mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-        mediaRecorder.onstop = () => {
-          fullAudioBlob = new Blob(chunks, { type: 'audio/webm' });
+        // Full-take recorder: only used for the <audio> preview player.
+        fullChunks = [];
+        fullRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+        fullRecorder.ondataavailable = e => { if (e.data.size > 0) fullChunks.push(e.data); };
+        fullRecorder.onstop = () => {
+          fullAudioBlob = new Blob(fullChunks, { type: 'audio/webm' });
           player.src = URL.createObjectURL(fullAudioBlob);
-          splitBtn.disabled = false;
-          log("Enregistrement terminé.");
         };
+        fullRecorder.start(500);
 
-        mediaRecorder.start(500);
+        // Segment recorder: this is what actually gets cut. Every bookmark
+        // stops it and immediately starts a fresh one, so each piece is a
+        // real, independently-encoded file with no timestamp math involved.
+        startNewSegment();
+
         startTime = Date.now();
         timerInterval = setInterval(updateTimer, 200);
         isRecording = true;
@@ -133,12 +142,30 @@
       timerEl.textContent = `${String(Math.floor(elapsed/60)).padStart(2,'0')}:${String(elapsed%60).padStart(2,'0')}`;
     }
 
+    function startNewSegment() {
+      segmentChunks = [];
+      segmentRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+      segmentRecorder.ondataavailable = e => { if (e.data.size > 0) segmentChunks.push(e.data); };
+      segmentRecorder.onstop = () => {
+        const blob = new Blob(segmentChunks, { type: 'audio/webm' });
+        segmentBlobs.push(blob);
+        if (isFinalizing) {
+          splitBtn.disabled = segmentBlobs.length === 0;
+          log(`Enregistrement terminé — ${segmentBlobs.length} segment(s) prêt(s) à découper.`);
+        }
+      };
+      segmentRecorder.start(500);
+    }
+
     bookmarkBtn.onclick = () => {
-      if (!isRecording) return;
+      if (!isRecording || !segmentRecorder) return;
       const timeSec = Math.floor((Date.now() - startTime) / 1000);
       bookmarks.push({ time: timeSec });
       renderBookmarks();
-      log(`Bookmark ajouté à ${Math.floor(timeSec/60)}:${(timeSec%60).toString().padStart(2,'0')}`);
+      log(`Bookmark ajouté à ${Math.floor(timeSec/60)}:${(timeSec%60).toString().padStart(2,'0')} — nouveau segment démarré.`);
+      // Close the current segment natively and start the next one right away.
+      segmentRecorder.stop();
+      startNewSegment();
     };
 
     function renderBookmarks() {
@@ -157,12 +184,16 @@
     }
 
     window.removeBookmark = (i) => {
+      // Display-only: the cut has already happened natively at record time,
+      // so this just removes it from the list — it won't merge audio back.
       bookmarks.splice(i, 1);
       renderBookmarks();
     };
 
     stopBtn.onclick = () => {
-      if (mediaRecorder) mediaRecorder.stop();
+      isFinalizing = true;
+      if (fullRecorder) fullRecorder.stop();
+      if (segmentRecorder) segmentRecorder.stop(); // finalizes the last segment
       if (stream) stream.getTracks().forEach(t => t.stop());
       clearInterval(timerInterval);
       isRecording = false;
@@ -188,10 +219,9 @@
       return output;
     }
 
-    function encodeMp3FromChannel(channelData, sampleRate, startSample, endSample) {
+    function encodeMp3FromChannel(channelData, sampleRate) {
       const mp3encoder = new lamejs.Mp3Encoder(1, sampleRate, 128);
-      const samples = channelData.subarray(startSample, endSample);
-      const pcm = floatTo16BitPCM(samples);
+      const pcm = floatTo16BitPCM(channelData);
       const blockSize = 1152;
       const mp3Data = [];
       for (let i = 0; i < pcm.length; i += blockSize) {
@@ -204,32 +234,29 @@
       return new Blob(mp3Data, { type: 'audio/mp3' });
     }
 
+    // Each entry in segmentBlobs is already a correctly-bounded, independently
+    // recorded webm file (the cut happened live via stop/start of the
+    // MediaRecorder, not by slicing sample indices after the fact). We just
+    // decode each one fully and re-encode it whole as an mp3 — no timestamp
+    // math, so no drift.
     splitBtn.onclick = async () => {
-      if (!fullAudioBlob) {
-        log("Aucun enregistrement à découper.");
+      if (!segmentBlobs.length) {
+        log("Aucun segment à découper.");
         return;
       }
       splitBtn.disabled = true;
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const audioCtx = new AudioCtx();
       try {
-        log("Décodage de l'audio...");
-        const arrayBuffer = await fullAudioBlob.arrayBuffer();
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        const audioCtx = new AudioCtx();
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-        const sampleRate = audioBuffer.sampleRate;
-        const channelData = audioBuffer.getChannelData(0); // mono mixdown from channel 0
-
-        const sortedTimes = bookmarks.map(b => b.time).sort((a, b) => a - b);
-        const boundaries = [0, ...sortedTimes, audioBuffer.duration];
-
         const zip = new JSZip();
-        const segmentCount = boundaries.length - 1;
+        const segmentCount = segmentBlobs.length;
 
         for (let i = 0; i < segmentCount; i++) {
-          const startSample = Math.floor(boundaries[i] * sampleRate);
-          const endSample = Math.floor(boundaries[i + 1] * sampleRate);
-          log(`Encodage segment ${i + 1}/${segmentCount}...`);
-          const mp3Blob = encodeMp3FromChannel(channelData, sampleRate, startSample, endSample);
+          log(`Décodage + encodage segment ${i + 1}/${segmentCount}...`);
+          const arrayBuffer = await segmentBlobs[i].arrayBuffer();
+          const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+          const channelData = audioBuffer.getChannelData(0); // mono mixdown
+          const mp3Blob = encodeMp3FromChannel(channelData, audioBuffer.sampleRate);
           const filename = (i === segmentCount - 1) ? 'final.mp3' : `${i}.mp3`;
           zip.file(filename, mp3Blob);
         }
@@ -245,11 +272,11 @@
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
         log(`ZIP téléchargé ! (${segmentCount} fichier(s))`);
-        audioCtx.close();
       } catch (err) {
         console.error(err);
         log("Erreur lors du découpage : " + err.message);
       } finally {
+        audioCtx.close();
         splitBtn.disabled = false;
       }
     };
