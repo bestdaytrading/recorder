@@ -6,7 +6,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Enregistreur + Bluetooth Mic</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
     button, select { padding: 12px 16px; margin: 8px 4px; font-size: 16px; width: 100%; max-width: 420px; }
@@ -33,7 +32,7 @@
   <h2>📌 Bookmarks</h2>
   <ul id="bookmarkList"></ul>
 
-  <button id="splitBtn" disabled>✂️ Découper et télécharger ZIP (0.mp3, 1.mp3...)</button>
+  <button id="splitBtn" disabled>✂️ Découper et télécharger ZIP (0.webm, 1.webm...)</button>
 
   <script>
     // Variables globales
@@ -208,57 +207,26 @@
       player.play().catch(err => log("Lecture impossible : " + err.message));
     }, { once: false });
 
-    // ---------- Découpage + encodage MP3 + ZIP ----------
-
-    function floatTo16BitPCM(input) {
-      const output = new Int16Array(input.length);
-      for (let i = 0; i < input.length; i++) {
-        let s = Math.max(-1, Math.min(1, input[i]));
-        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-      }
-      return output;
-    }
-
-    function encodeMp3FromChannel(channelData, sampleRate) {
-      const mp3encoder = new lamejs.Mp3Encoder(1, sampleRate, 128);
-      const pcm = floatTo16BitPCM(channelData);
-      const blockSize = 1152;
-      const mp3Data = [];
-      for (let i = 0; i < pcm.length; i += blockSize) {
-        const chunk = pcm.subarray(i, i + blockSize);
-        const mp3buf = mp3encoder.encodeBuffer(chunk);
-        if (mp3buf.length > 0) mp3Data.push(mp3buf);
-      }
-      const end = mp3encoder.flush();
-      if (end.length > 0) mp3Data.push(end);
-      return new Blob(mp3Data, { type: 'audio/mp3' });
-    }
-
-    // Each entry in segmentBlobs is already a correctly-bounded, independently
-    // recorded webm file (the cut happened live via stop/start of the
-    // MediaRecorder, not by slicing sample indices after the fact). We just
-    // decode each one fully and re-encode it whole as an mp3 — no timestamp
-    // math, so no drift.
+    // ---------- Découpage : export direct des segments natifs ----------
+    // On n'essaie plus de décoder/ré-encoder en mp3 : decodeAudioData()
+    // (l'API Web Audio) est connue pour échouer sur des blobs produits par
+    // MediaRecorder, surtout sur des segments courts, à cause d'un en-tête
+    // webm incomplet. On zippe donc directement les segments natifs .webm
+    // (Opus) — c'est le même type de blob que le lecteur de prévisualisation
+    // lit déjà sans problème.
     splitBtn.onclick = async () => {
       if (!segmentBlobs.length) {
         log("Aucun segment à découper.");
         return;
       }
       splitBtn.disabled = true;
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const audioCtx = new AudioCtx();
       try {
         const zip = new JSZip();
         const segmentCount = segmentBlobs.length;
 
         for (let i = 0; i < segmentCount; i++) {
-          log(`Décodage + encodage segment ${i + 1}/${segmentCount}...`);
-          const arrayBuffer = await segmentBlobs[i].arrayBuffer();
-          const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-          const channelData = audioBuffer.getChannelData(0); // mono mixdown
-          const mp3Blob = encodeMp3FromChannel(channelData, audioBuffer.sampleRate);
-          const filename = (i === segmentCount - 1) ? 'final.mp3' : `${i}.mp3`;
-          zip.file(filename, mp3Blob);
+          const filename = (i === segmentCount - 1) ? 'final.webm' : `${i}.webm`;
+          zip.file(filename, segmentBlobs[i]);
         }
 
         log("Création du ZIP...");
@@ -271,12 +239,11 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        log(`ZIP téléchargé ! (${segmentCount} fichier(s))`);
+        log(`ZIP téléchargé ! (${segmentCount} fichier(s) .webm)`);
       } catch (err) {
         console.error(err);
         log("Erreur lors du découpage : " + err.message);
       } finally {
-        audioCtx.close();
         splitBtn.disabled = false;
       }
     };
