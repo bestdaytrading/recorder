@@ -22,8 +22,8 @@
   <label>Microphone :</label><br>
   <select id="micSelect"></select><br><br>
   <label style="display:flex; align-items:center; gap:8px; max-width:420px;">
-    <input type="checkbox" id="rawModeCheckbox" style="width:auto;">
-    Désactiver écho/réduction de bruit (à essayer si le Bluetooth reste muet)
+    <input type="checkbox" id="rawModeCheckbox" style="width:auto;" checked>
+    Mode qualité brute (recommandé pour micro externe ; à décocher seulement si un Bluetooth reste muet)
   </label><br>
 
   <button id="refreshBtn">🔄 Rafraîchir liste micros</button>
@@ -100,15 +100,33 @@
     // Démarrer enregistrement avec le micro sélectionné
     recordBtn.onclick = async () => {
       try {
+        const rawMode = document.getElementById('rawModeCheckbox').checked;
+
         const constraints = {
           audio: {
             deviceId: currentDeviceId ? { exact: currentDeviceId } : undefined,
-            echoCancellation: true,
-            noiseSuppression: true
+            // En mode "qualité brute", on désactive tout le pipeline vocal
+            // (écho/bruit/gain auto) : ces filtres sont pensés pour un appel
+            // téléphonique et dégradent nettement un bon micro externe
+            // (souvent en le repassant en mono basse fréquence). Un
+            // Bluetooth muet peut aussi bénéficier de les désactiver.
+            echoCancellation: !rawMode,
+            noiseSuppression: !rawMode,
+            autoGainControl: !rawMode,
+            sampleRate: { ideal: 48000 },
+            channelCount: { ideal: 1 }
           }
         };
 
         stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+        // Diagnostic : ce que le navigateur a réellement négocié avec le
+        // périphérique (utile pour comprendre un souci de qualité ou de
+        // silence — ex. le mic bascule sur 16 kHz malgré la demande).
+        const track = stream.getAudioTracks()[0];
+        if (track) {
+          console.log("Paramètres audio négociés :", track.getSettings());
+        }
 
         bookmarks = [];
         segmentBlobs = [];
@@ -117,6 +135,13 @@
         splitBtn.disabled = true;
         isFinalizing = false;
         isSwitchingSegment = false;
+
+        // Petite pause avant de démarrer l'enregistrement : un casque
+        // Bluetooth a parfois besoin d'un instant pour basculer de son
+        // profil "sortie audio" vers son profil "micro", sinon le tout
+        // début (voire plus) est silencieux.
+        log("Préparation du micro...");
+        await new Promise(r => setTimeout(r, 600));
 
         // Un seul MediaRecorder actif à la fois sur le flux : c'est ce qui
         // garantit que l'audio n'est jamais vide. Avoir un deuxième
@@ -145,7 +170,12 @@
 
     function startNewSegment() {
       segmentChunks = [];
-      segmentRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+      // audioBitsPerSecond explicite : le défaut du navigateur est souvent
+      // assez conservateur et peut sur-compresser un micro externe propre.
+      segmentRecorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus',
+        audioBitsPerSecond: 192000
+      });
       segmentRecorder.ondataavailable = e => { if (e.data.size > 0) segmentChunks.push(e.data); };
       segmentRecorder.onstop = () => {
         const blob = new Blob(segmentChunks, { type: 'audio/webm' });
