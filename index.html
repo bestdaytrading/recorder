@@ -11,6 +11,9 @@
     button, select { padding: 12px 16px; margin: 8px 4px; font-size: 16px; width: 100%; max-width: 420px; }
     .status { margin: 15px 0; padding: 12px; background: #e0f0ff; border-radius: 8px; }
     button:disabled { opacity: 0.5; }
+    .segment-item { padding: 12px; background: #f0f0f0; margin: 6px 0; border-radius: 6px; }
+    .segment-item audio { width: 100%; margin-top: 8px; }
+    .segment-label { font-weight: bold; }
   </style>
 </head>
 <body>
@@ -18,6 +21,10 @@
 
   <label>Microphone :</label><br>
   <select id="micSelect"></select><br><br>
+  <label style="display:flex; align-items:center; gap:8px; max-width:420px;">
+    <input type="checkbox" id="rawModeCheckbox" style="width:auto;">
+    Désactiver écho/réduction de bruit (à essayer si le Bluetooth reste muet)
+  </label><br>
 
   <button id="refreshBtn">🔄 Rafraîchir liste micros</button>
   <button id="recordBtn">▶️ Démarrer l'enregistrement</button>
@@ -27,23 +34,25 @@
   <p>Temps : <strong><span id="timer">00:00</span></strong></p>
   <div class="status" id="status">Prêt</div>
 
-  <audio id="player" controls style="width:100%; margin:15px 0;"></audio>
-
-  <h2>📌 Bookmarks</h2>
+  <h2>📌 Bookmarks (pendant l'enregistrement)</h2>
   <ul id="bookmarkList"></ul>
 
-  <button id="splitBtn" disabled>✂️ Découper et télécharger ZIP (0.webm, 1.webm...)</button>
+  <h2>🎧 Segments (après arrêt)</h2>
+  <p style="font-size:14px;color:#555;">Écoute chaque segment ici avant de télécharger — c'est la garantie qu'il n'est pas vide.</p>
+  <ul id="segmentsList"></ul>
+
+  <button id="splitBtn" disabled>✂️ Télécharger ZIP (0.webm, 1.webm...)</button>
 
   <script>
     // Variables globales
-    let stream, fullAudioBlob;
-    let fullRecorder, fullChunks = [];
+    let stream;
     let segmentRecorder, segmentChunks = [];
     let segmentBlobs = []; // each entry = one native, precisely-cut webm segment
-    let bookmarks = []; // for display only (timestamps shown in the list)
+    let bookmarks = []; // live display only, during recording
     let startTime, timerInterval;
     let isRecording = false;
     let isFinalizing = false;
+    let isSwitchingSegment = false;
     let currentDeviceId = null;
 
     const micSelect = document.getElementById('micSelect');
@@ -52,8 +61,8 @@
     const stopBtn = document.getElementById('stopBtn');
     const bookmarkBtn = document.getElementById('bookmarkBtn');
     const splitBtn = document.getElementById('splitBtn');
-    const player = document.getElementById('player');
     const bookmarkList = document.getElementById('bookmarkList');
+    const segmentsList = document.getElementById('segmentsList');
     const timerEl = document.getElementById('timer');
     const statusEl = document.getElementById('status');
 
@@ -104,23 +113,15 @@
         bookmarks = [];
         segmentBlobs = [];
         bookmarkList.innerHTML = '';
+        segmentsList.innerHTML = '';
         splitBtn.disabled = true;
         isFinalizing = false;
         isSwitchingSegment = false;
 
-        // Full-take recorder: only used for the <audio> preview player.
-        fullChunks = [];
-        fullRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-        fullRecorder.ondataavailable = e => { if (e.data.size > 0) fullChunks.push(e.data); };
-        fullRecorder.onstop = () => {
-          fullAudioBlob = new Blob(fullChunks, { type: 'audio/webm' });
-          player.src = URL.createObjectURL(fullAudioBlob);
-        };
-        fullRecorder.start(500);
-
-        // Segment recorder: this is what actually gets cut. Every bookmark
-        // stops it and immediately starts a fresh one, so each piece is a
-        // real, independently-encoded file with no timestamp math involved.
+        // Un seul MediaRecorder actif à la fois sur le flux : c'est ce qui
+        // garantit que l'audio n'est jamais vide. Avoir un deuxième
+        // recorder (ex. pour une prévisualisation live) en parallèle
+        // provoquait un silence sur l'un des deux flux enregistrés.
         startNewSegment();
 
         startTime = Date.now();
@@ -142,8 +143,6 @@
       timerEl.textContent = `${String(Math.floor(elapsed/60)).padStart(2,'0')}:${String(elapsed%60).padStart(2,'0')}`;
     }
 
-    let isSwitchingSegment = false;
-
     function startNewSegment() {
       segmentChunks = [];
       segmentRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
@@ -153,13 +152,14 @@
         segmentBlobs.push(blob);
         console.log(`Segment ${segmentBlobs.length - 1} : ${blob.size} octets`);
         if (isFinalizing) {
+          renderSegments();
           splitBtn.disabled = segmentBlobs.length === 0;
-          log(`Enregistrement terminé — ${segmentBlobs.length} segment(s) prêt(s) à découper.`);
+          log(`Enregistrement terminé — ${segmentBlobs.length} segment(s). Écoute-les ci-dessous avant de télécharger.`);
         } else {
-          // Only start the next segment once this recorder has fully closed —
-          // starting it earlier (right after calling .stop()) left two
-          // MediaRecorder instances briefly attached to the same track at
-          // once, which is what was corrupting the resulting files.
+          // On ne démarre le segment suivant qu'une fois celui-ci
+          // complètement fermé (onstop déjà déclenché) : le faire plus tôt
+          // laissait deux MediaRecorder actifs en même temps sur le même
+          // flux, ce qui coupait le son de l'un des deux.
           startNewSegment();
           isSwitchingSegment = false;
           bookmarkBtn.disabled = false;
@@ -176,8 +176,8 @@
       log(`Bookmark ajouté à ${Math.floor(timeSec/60)}:${(timeSec%60).toString().padStart(2,'0')} — clôture du segment...`);
       isSwitchingSegment = true;
       bookmarkBtn.disabled = true;
-      // This triggers segmentRecorder.onstop above, which starts the next
-      // segment once the current one is fully closed.
+      // Déclenche segmentRecorder.onstop ci-dessus, qui démarre le segment
+      // suivant une fois celui-ci vraiment fermé.
       segmentRecorder.stop();
     };
 
@@ -187,26 +187,40 @@
         const min = Math.floor(b.time/60);
         const sec = (b.time%60).toString().padStart(2,'0');
         const li = document.createElement('li');
-        li.style.padding = "12px";
+        li.style.padding = "8px";
         li.style.background = "#f0f0f0";
-        li.style.margin = "6px 0";
+        li.style.margin = "4px 0";
         li.style.borderRadius = "6px";
-        li.innerHTML = `Segment ${i} — ${min}:${sec} <button onclick="removeBookmark(${i})" style="float:right;color:red;">×</button>`;
+        li.textContent = `Bookmark ${i} — ${min}:${sec} (ferme le segment ${i})`;
         bookmarkList.appendChild(li);
       });
     }
 
-    window.removeBookmark = (i) => {
-      // Display-only: the cut has already happened natively at record time,
-      // so this just removes it from the list — it won't merge audio back.
-      bookmarks.splice(i, 1);
-      renderBookmarks();
-    };
+    function renderSegments() {
+      segmentsList.innerHTML = '';
+      segmentBlobs.forEach((blob, i) => {
+        const isLast = i === segmentBlobs.length - 1;
+        const name = isLast ? 'final' : String(i);
+        const li = document.createElement('li');
+        li.className = 'segment-item';
+
+        const label = document.createElement('div');
+        label.className = 'segment-label';
+        label.textContent = `Segment ${name}.webm — ${(blob.size / 1024).toFixed(1)} Ko`;
+        li.appendChild(label);
+
+        const audioEl = document.createElement('audio');
+        audioEl.controls = true;
+        audioEl.src = URL.createObjectURL(blob);
+        li.appendChild(audioEl);
+
+        segmentsList.appendChild(li);
+      });
+    }
 
     stopBtn.onclick = () => {
       isFinalizing = true;
-      if (fullRecorder) fullRecorder.stop();
-      if (segmentRecorder) segmentRecorder.stop(); // finalizes the last segment
+      if (segmentRecorder) segmentRecorder.stop(); // finalise le dernier segment
       if (stream) stream.getTracks().forEach(t => t.stop());
       clearInterval(timerInterval);
       isRecording = false;
@@ -215,22 +229,15 @@
       bookmarkBtn.disabled = true;
     };
 
-    // Lecture manuelle depuis le player natif : on tente un play() protégé
-    // pour éviter les erreurs silencieuses si l'utilisateur clique play.
-    player.addEventListener('play', () => {
-      player.play().catch(err => log("Lecture impossible : " + err.message));
-    }, { once: false });
-
-    // ---------- Découpage : export direct des segments natifs ----------
-    // On n'essaie plus de décoder/ré-encoder en mp3 : decodeAudioData()
+    // ---------- Téléchargement : export direct des segments natifs ----------
+    // On n'essaie pas de décoder/ré-encoder en mp3 : decodeAudioData()
     // (l'API Web Audio) est connue pour échouer sur des blobs produits par
     // MediaRecorder, surtout sur des segments courts, à cause d'un en-tête
     // webm incomplet. On zippe donc directement les segments natifs .webm
-    // (Opus) — c'est le même type de blob que le lecteur de prévisualisation
-    // lit déjà sans problème.
+    // (Opus) — le même type de blob que tu viens d'écouter ci-dessus.
     splitBtn.onclick = async () => {
       if (!segmentBlobs.length) {
-        log("Aucun segment à découper.");
+        log("Aucun segment à télécharger.");
         return;
       }
       splitBtn.disabled = true;
@@ -256,7 +263,7 @@
         log(`ZIP téléchargé ! (${segmentCount} fichier(s) .webm)`);
       } catch (err) {
         console.error(err);
-        log("Erreur lors du découpage : " + err.message);
+        log("Erreur lors du téléchargement : " + err.message);
       } finally {
         splitBtn.disabled = false;
       }
